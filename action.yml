@@ -1,0 +1,122 @@
+name: Groundrule
+description: Check pull requests against your engineering standards and keep agent instructions in sync.
+author: Groundrule
+branding:
+  icon: check-square
+  color: orange
+
+inputs:
+  version:
+    description: Groundrule CLI version to run.
+    default: latest
+  base:
+    description: Git ref to compare against. Defaults to the pull request base, or the previous commit on push.
+    default: ""
+  fail-on:
+    description: Lowest severity that fails the check (blocker, warning, none). Defaults to the repository config.
+    default: ""
+  sarif:
+    description: Upload findings to GitHub code scanning (needs security-events write permission).
+    default: "true"
+  check-sync:
+    description: Fail if generated agent instructions are out of date.
+    default: "true"
+  working-directory:
+    description: Directory containing the repository to check.
+    default: "."
+  token:
+    description: >-
+      A Groundrule API token with "Upload scans and check results". When set, the result is sent
+      to your organization on Groundrule (check --upload), with the pull request it was for, and
+      so is what the repository delivers to coding agents (sync --check --upload).
+      Pass it from a secret, e.g. secrets.GROUNDRULE_TOKEN.
+    default: ""
+  snippets:
+    description: With token, include the offending line of each finding (redacted). "false" sends none.
+    default: "true"
+  sigstore:
+    description: >-
+      With token, sign the result with this job's identity through Sigstore (keyless, RFC 0009).
+      Needs "permissions: id-token: write" on the job. Opt-in: it records the workflow identity
+      and the result's hash in Sigstore's public log.
+    default: "false"
+  url:
+    description: Groundrule platform address, for self-hosted or test platforms.
+    default: ""
+
+outputs:
+  exit-code:
+    description: 0 passed, 1 failed, 2 configuration error.
+    value: ${{ steps.check.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24
+
+    - id: check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GROUNDRULE: npx --yes @groundrule/cli@${{ inputs.version }}
+        INPUT_BASE: ${{ inputs.base }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        # The token travels in the environment, never on the command line. A token set on
+        # the job (GROUNDRULE_TOKEN) still works when the token input is empty.
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_URL: ${{ inputs.url }}
+        SNIPPETS: ${{ inputs.snippets }}
+        SIGSTORE: ${{ inputs.sigstore }}
+      run: |
+        set +e
+        base="${INPUT_BASE:-${PR_BASE:-$PUSH_BEFORE}}"
+        args=(check --format sarif --output groundrule.sarif --summary "$GITHUB_STEP_SUMMARY")
+        if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ]; then
+          git fetch --no-tags --quiet origin "$base" 2>/dev/null
+          args+=(--base "$base")
+        else
+          args+=(--all)
+        fi
+        [ -n "$FAIL_ON" ] && args+=(--fail-on "$FAIL_ON")
+        [ -n "$INPUT_URL" ] && export GROUNDRULE_URL="$INPUT_URL"
+        if [ -n "$INPUT_TOKEN" ]; then
+          export GROUNDRULE_TOKEN="$INPUT_TOKEN"
+          args+=(--upload)
+          [ "$SNIPPETS" = "false" ] && args+=(--no-snippets)
+          [ "$SIGSTORE" = "true" ] && args+=(--sigstore)
+        fi
+        $GROUNDRULE "${args[@]}"
+        code=$?
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - if: inputs.check-sync == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_URL: ${{ inputs.url }}
+      run: |
+        [ -n "$INPUT_URL" ] && export GROUNDRULE_URL="$INPUT_URL"
+        cli=(npx --yes "@groundrule/cli@${{ inputs.version }}")
+        args=(sync --check)
+        # With a token, also report what the repository delivers to coding agents
+        # (CLI 0.5.0 and later; an older pinned version just checks).
+        if [ -n "$INPUT_TOKEN" ]; then
+          export GROUNDRULE_TOKEN="$INPUT_TOKEN"
+          if "${cli[@]}" sync --help | grep -q -- "--upload"; then args+=(--upload); fi
+        fi
+        "${cli[@]}" "${args[@]}"
+
+    - if: always() && inputs.sarif == 'true' && hashFiles(format('{0}/groundrule.sarif', inputs.working-directory)) != ''
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.working-directory }}/groundrule.sarif
+        category: groundrule
+
+    - shell: bash
+      run: exit ${{ steps.check.outputs.exit-code }}
